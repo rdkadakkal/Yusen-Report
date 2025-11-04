@@ -9,7 +9,6 @@ from openpyxl.styles import Font, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
 
 st.set_page_config(page_title="Yusen Monthly Tracking Report", layout="wide")
-
 st.title("Yusen Monthly Tracking Report Generator")
 
 st.markdown(
@@ -44,16 +43,11 @@ def to_bool(x):
     return False
 
 def build_summary(df: pd.DataFrame) -> pd.DataFrame:
-    # Normalize columns
-    if "Tenant Name" not in df.columns:
-        raise ValueError("Missing column: 'Tenant Name'")
-    if "Tracked" not in df.columns:
-        raise ValueError("Missing column: 'Tracked'")
-    # The user confirmed the date is in 'Period Date'
-    if "Period Date" not in df.columns:
-        # fallback if needed
-        alt_cols = [c for c in df.columns if "date" in c.lower()]
-        raise ValueError("Missing column: 'Period Date' (found alternatives: %s)" % alt_cols)
+    # Validate columns
+    needed = ["Tenant Name", "Tracked", "Period Date"]
+    missing = [c for c in needed if c not in df.columns]
+    if missing:
+        raise ValueError(f"Missing required column(s): {missing}")
 
     # Clean + parse
     df = df.copy()
@@ -63,41 +57,46 @@ def build_summary(df: pd.DataFrame) -> pd.DataFrame:
     df = df.dropna(subset=["Period Date"])
     df["YearMonth"] = df["Period Date"].dt.to_period("M").astype(str)
 
-    # Ensure required tenants exist even if 0 rows
-    existing_tenants = set(df["Tenant Name"].unique())
-    missing_required = [t for t in REQUIRED_TENANTS if t not in existing_tenants]
-    # Create zero-rows for missing tenants using the months present in df (or at least current month)
+    # Months present (or fallback to current month if no data)
     months = sorted(df["YearMonth"].unique().tolist())
     if not months:
         months = [datetime.now().strftime("%Y-%m")]
 
-    if missing_required:
-        add_rows = []
-        for t in missing_required:
-            for m in months:
-                add_rows.append({"Tenant Name": t, "Tracked": False, "Period Date": pd.NaT, "YearMonth": m})
-        df = pd.concat([df, pd.DataFrame(add_rows)], ignore_index=True)
+    # Tenants to include = union of required + present in data
+    present_tenants = sorted(df["Tenant Name"].unique().tolist())
+    tenants_all = sorted(set(present_tenants).union(REQUIRED_TENANTS))
 
-    # Aggregate
-    summary = (
-        df.groupby(["Tenant Name", "YearMonth"])
+    # Aggregate ONLY real rows (do NOT add placeholder rows)
+    grouped = (
+        df.groupby(["Tenant Name", "YearMonth"], as_index=False)
           .agg(
-              Volume_Created=("Tracked", "count"),
+              Volume_Created=("Tracked", "size"),
               Volume_Tracked=("Tracked", lambda x: np.sum(x.astype(bool))),
               Volume_Not_Tracked=("Tracked", lambda x: np.sum(~x.astype(bool))),
           )
-          .reset_index()
     )
-    summary["Tracked_Percentage"] = np.where(
-        summary["Volume_Created"] > 0,
-        summary["Volume_Tracked"] / summary["Volume_Created"],
+
+    # Reindex to full grid (tenants_all x months) -> fill zeros
+    idx = pd.MultiIndex.from_product([tenants_all, months], names=["Tenant Name", "YearMonth"])
+    grouped = grouped.set_index(["Tenant Name", "YearMonth"]).reindex(idx)
+
+    # Fill counts with zero; percentage computed after
+    for col in ["Volume_Created", "Volume_Tracked", "Volume_Not_Tracked"]:
+        grouped[col] = grouped[col].fillna(0).astype(int)
+
+    grouped = grouped.reset_index()
+    grouped["Tracked_Percentage"] = np.where(
+        grouped["Volume_Created"] > 0,
+        grouped["Volume_Tracked"] / grouped["Volume_Created"],
         0.0
     )
-    return summary
+    return grouped
 
-def to_excel_report(summary: pd.DataFrame, tenants_first: list[str] | None = None) -> bytes:
-    # Prepare pivot
+def to_excel_report(summary: pd.DataFrame) -> bytes:
     metrics = ["Volume_Created", "Volume_Tracked", "Volume_Not_Tracked", "Tracked_Percentage"]
+    months = sorted(summary["YearMonth"].unique().tolist())
+
+    # Pivot
     pivot = summary.pivot_table(
         index="Tenant Name",
         columns="YearMonth",
@@ -105,17 +104,14 @@ def to_excel_report(summary: pd.DataFrame, tenants_first: list[str] | None = Non
         fill_value=0,
         aggfunc="first",
     )
-    months = sorted(summary["YearMonth"].unique().tolist())
 
-    # Order tenants: REQUIRED_TENANTS first (in given order), then the rest alphabetically
+    # Order tenants: REQUIRED first, then others alpha
     all_tenants = list(pivot.index.unique())
     remaining = sorted([t for t in all_tenants if t not in REQUIRED_TENANTS])
-    ordered_tenants = REQUIRED_TENANTS + remaining
-    # Reindex pivot to ordered tenants (ignore missing)
-    valid_ordered = [t for t in ordered_tenants if t in all_tenants]
-    pivot = pivot.reindex(index=valid_ordered)
+    ordered = [t for t in REQUIRED_TENANTS if t in all_tenants] + remaining
+    pivot = pivot.reindex(index=ordered)
 
-    # Write with openpyxl
+    # openpyxl export with merged headers
     wb = Workbook()
     ws = wb.active
     ws.title = "Summary"
@@ -127,7 +123,7 @@ def to_excel_report(summary: pd.DataFrame, tenants_first: list[str] | None = Non
     right = Alignment(horizontal="right", vertical="center")
     left = Alignment(horizontal="left", vertical="center")
 
-    # Header
+    # Headers
     ws.cell(row=1, column=1, value="Tenant Name")
     ws.merge_cells(start_row=1, start_column=1, end_row=2, end_column=1)
     ws["A1"].font = header_font
@@ -140,10 +136,8 @@ def to_excel_report(summary: pd.DataFrame, tenants_first: list[str] | None = Non
         ws.merge_cells(start_row=1, start_column=col_pointer, end_row=1, end_column=col_pointer + len(metrics) - 1)
         ws.cell(row=1, column=col_pointer, value=month).font = header_font
         ws.cell(row=1, column=col_pointer).alignment = center
-
         for i, m in enumerate(metrics):
-            label = m.replace("_", " ")
-            ws.cell(row=2, column=col_pointer + i, value=label).font = header_font
+            ws.cell(row=2, column=col_pointer + i, value=m.replace("_", " ")).font = header_font
             ws.cell(row=2, column=col_pointer + i).alignment = center
         col_pointer += len(metrics)
 
@@ -184,15 +178,12 @@ def to_excel_report(summary: pd.DataFrame, tenants_first: list[str] | None = Non
         ws.cell(row=2, column=c).border = border_all
         ws.cell(row=2, column=c).alignment = center
 
-    # Column widths
+    # Column widths & freeze panes
     ws.column_dimensions["A"].width = 36
     for c in range(2, max_col + 1):
         ws.column_dimensions[get_column_letter(c)].width = 16
-
-    # Freeze panes
     ws.freeze_panes = "B3"
 
-    # Save to bytes
     bio = io.BytesIO()
     wb.save(bio)
     bio.seek(0)
@@ -205,19 +196,15 @@ if uploaded is not None:
     try:
         df = pd.read_excel(uploaded)
         st.success("File loaded successfully.")
-        # Optional quick preview
         with st.expander("Preview first 20 rows"):
             st.dataframe(df.head(20))
-        # Build summary
+
         summary = build_summary(df)
 
-        # Show a small preview of the aggregated data
         st.subheader("Aggregated Preview")
         st.dataframe(summary.head(20))
 
-        # Generate report
         xls_bytes = to_excel_report(summary)
-
         default_name = f"Yusen_Style_Summary_{datetime.now().strftime('%Y%m%d_%H%M')}.xlsx"
         st.download_button(
             label="Download Excel Report",
